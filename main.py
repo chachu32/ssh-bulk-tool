@@ -1,3 +1,5 @@
+"""FortiGate SSH workflow: ping, dual CLI backup, staged eligibility, rolling upgrade.
+For browser-only access (https://IP:8080), use web_upgrade_assist.py instead."""
 import paramiko
 import threading
 from datetime import datetime
@@ -5,6 +7,7 @@ import subprocess
 import re
 import os
 import time
+import csv
 from dataclasses import dataclass
 from typing import Optional
 
@@ -31,6 +34,7 @@ DETECT_COMMAND = "get system status"
 UPGRADE_COMMAND = "execute update-now"
 
 OUTPUT_FILE = "output.log"
+SUMMARY_FILE = "summary.csv"
 MAX_THREADS = 20
 PING_TIMEOUT_MS = 1200
 SSH_TIMEOUT_S = 7
@@ -51,6 +55,9 @@ STOP_ON_UPGRADE_FAILURE = True   # if an upgrade step errors, stop further upgra
 # Optional: after sending upgrade, wait until device responds to ping again
 WAIT_FOR_PING_AFTER_UPGRADE = True
 PING_RECOVERY_TIMEOUT_S = 15 * 60
+
+LOG_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -312,8 +319,50 @@ def upgrade_device(ip: str) -> tuple[bool, str]:
 
 
 def log_output(ip, message):
-    with open(OUTPUT_FILE, "a") as f:
-        f.write(f"[{datetime.now()}] {ip}:\n{message}\n{'-'*50}\n")
+    with LOG_LOCK:
+        with open(OUTPUT_FILE, "a", encoding="utf-8", newline="\n") as f:
+            f.write(f"[{datetime.now()}] {ip}:\n{message}\n{'-'*50}\n")
+
+
+def write_summary_csv(stage_results: list[StageResult], upgrade_results: dict[str, tuple[bool, str]]):
+    rows = []
+    for r in sorted(stage_results, key=lambda x: x.ip):
+        upgraded = r.ip in upgrade_results
+        up_ok, up_msg = upgrade_results.get(r.ip, (False, ""))
+        rows.append(
+            {
+                "ip": r.ip,
+                "reachable": r.reachable,
+                "ssh_ok": r.ssh_ok,
+                "is_fortigate": r.is_fortigate,
+                "version": r.version or "",
+                "backup_ok": r.backup_ok,
+                "eligible": r.eligible,
+                "stage_message": r.message.replace("\n", " | "),
+                "upgraded": upgraded,
+                "upgrade_ok": up_ok if upgraded else "",
+                "upgrade_message": up_msg.replace("\n", " | ") if upgraded else "",
+            }
+        )
+
+    fieldnames = [
+        "ip",
+        "reachable",
+        "ssh_ok",
+        "is_fortigate",
+        "version",
+        "backup_ok",
+        "eligible",
+        "stage_message",
+        "upgraded",
+        "upgrade_ok",
+        "upgrade_message",
+    ]
+
+    with open(SUMMARY_FILE, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main():
@@ -328,12 +377,11 @@ def main():
     # Phase 1: Stage (parallel) — reachability, SSH, detect, backups, eligibility
     sem = threading.Semaphore(MAX_THREADS)
     stage_results: list[StageResult] = []
-    stage_lock = threading.Lock()
 
     def stage_worker(ip: str):
         with sem:
             r = stage_device(ip)
-            with stage_lock:
+            with STATE_LOCK:
                 stage_results.append(r)
 
     for ip in ips:
@@ -348,12 +396,14 @@ def main():
     log_output("SUMMARY", f"Staged {len(stage_results)} devices; eligible for upgrade: {len(eligible)}")
 
     if not DO_UPGRADE:
-        print("Dry-run done! Check output.log and backups/")
+        write_summary_csv(stage_results, {})
+        print("Dry-run done! Check output.log, summary.csv and backups/")
         return
 
     # Phase 2: Upgrade (rolling) — limited concurrency, cooldown, stop-on-failure
     up_sem = threading.Semaphore(max(1, int(UPGRADE_CONCURRENCY)))
     failures: list[str] = []
+    upgrade_results: dict[str, tuple[bool, str]] = {}
     upgrade_threads: list[threading.Thread] = []
 
     stop_flag = threading.Event()
@@ -363,10 +413,12 @@ def main():
             return
         with up_sem:
             ok, msg = upgrade_device(ip)
-            if not ok:
-                failures.append(ip)
-                if STOP_ON_UPGRADE_FAILURE:
-                    stop_flag.set()
+            with STATE_LOCK:
+                upgrade_results[ip] = (ok, msg)
+                if not ok:
+                    failures.append(ip)
+                    if STOP_ON_UPGRADE_FAILURE:
+                        stop_flag.set()
             # Cooldown between upgrades to avoid simultaneous reboots across branches
             time.sleep(max(0, int(UPGRADE_COOLDOWN_S)))
 
@@ -386,8 +438,9 @@ def main():
     for t in upgrade_threads:
         t.join()
 
+    write_summary_csv(stage_results, upgrade_results)
     log_output("SUMMARY", f"Upgrade finished. Eligible: {len(eligible)} Failures: {len(failures)}")
-    print("Done! Check output.log and backups/")
+    print("Done! Check output.log, summary.csv and backups/")
 
 
 if __name__ == "__main__":
